@@ -265,6 +265,7 @@ fn build_client(token: Option<&str>) -> Result<Client> {
         );
     }
     Client::builder()
+        .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
         .use_rustls_tls()
         .pool_max_idle_per_host(10)
@@ -276,8 +277,10 @@ fn build_client(token: Option<&str>) -> Result<Client> {
 
 #[derive(Error, Debug)]
 pub enum BatchError {
-    #[error("API error: {0}")]
-    ApiError(#[from] reqwest::Error),
+    #[error("API request failed with status {status}: {source}")]
+    ApiError { status: reqwest::StatusCode, source: reqwest::Error },
+    #[error("API request error: {0}")]
+    RequestError(#[from] reqwest::Error),
     #[error("Failed to compute token/s")]
     Invalid,
 }
@@ -293,19 +296,21 @@ pub async fn run_batch(
         model: model_name.to_string(),
     };
     let start_time = Instant::now();
+    let response = client.post(url).json(&request_payload).send().await?;
+    let duration = start_time.elapsed().as_secs_f64();
+    let status = response.status();
 
-    let api_response = client.post(url).json(&request_payload).send().await?;
-    let http_ok_response = api_response.error_for_status()?;
-    let parsed_response: EmbeddingResponse = http_ok_response.json().await?;
+    if !status.is_success() {
+        let source = response.error_for_status().unwrap_err();
+        return Err(BatchError::ApiError { status, source });
+    }
+    let result: EmbeddingResponse = response.json().await?;
+    let tokens = result.usage.total_tokens;
 
-    let duration_nanos = start_time.elapsed().as_nanos();
-    let tokens = parsed_response.usage.total_tokens;
-    let duration_sec = duration_nanos as f64 / 1_000_000_000.0;
-
-    if duration_sec <= 0.0 {
+    if duration <= 0.0 {
         return Err(BatchError::Invalid);
     }
-    let tps_f64 = tokens as f64 / duration_sec;
+    let tps_f64 = tokens as f64 / duration;
 
     if !tps_f64.is_finite() {
         return Err(BatchError::Invalid);
@@ -335,9 +340,10 @@ struct BenchResult {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
         .format_timestamp(None)
         .format_module_path(false)
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
         .init();
 
     let args = Args::parse();
