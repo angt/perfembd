@@ -24,16 +24,20 @@ struct Args {
     target_url: String,
 
     /// Path to the corpus file (one document per line).
-    #[arg(short, long)]
+    #[arg(short = 'c', long)]
     corpus_file: Option<PathBuf>,
 
     /// Number of documents per request batch.
-    #[arg(short, long, default_value_t = 128)]
+    #[arg(short = 'b', long, default_value_t = 128)]
     batch_size: usize,
 
     /// Number of benchmark iterations (full passes over the corpus).
     #[arg(short = 'n', long, default_value_t = 20)]
     iterations: usize,
+
+    /// Number of warm-up iterations (full passes over the corpus).
+    #[arg(short = 'w', long, default_value_t = 5)]
+    warmup_iterations: usize,
 
     /// Output file for results (JSON format).
     #[arg(short = 'o', long, default_value = "out.json")]
@@ -46,6 +50,22 @@ struct Args {
     /// Optional: Embedding model name.
     #[arg(short = 'm', long, default_value = "none")]
     model_name: String,
+
+    /// HTTP connect timeout in seconds.
+    #[arg(long, default_value_t = 15)]
+    connect_timeout: u64,
+
+    /// HTTP request timeout in seconds (for the entire request lifecycle).
+    #[arg(long, default_value_t = 90)]
+    request_timeout: u64,
+
+    /// HTTP pool idle timeout in seconds (how long an idle connection is kept alive).
+    #[arg(long, default_value_t = 90)]
+    pool_idle_timeout: u64,
+
+    /// Accept invalid TLS/SSL certificates.
+    #[arg(long, default_value_t = false)]
+    accept_invalid_certs: bool,
 }
 
 #[derive(Serialize)]
@@ -250,13 +270,13 @@ fn read_corpus<R: BufRead>(reader: R) -> Result<Vec<String>> {
         .collect()
 }
 
-fn build_client(token: Option<&str>) -> Result<Client> {
+fn build_client(args: &Args) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),
     );
-    if let Some(token) = token {
+    if let Some(token) = &args.token {
         headers.insert(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", token)
@@ -268,9 +288,10 @@ fn build_client(token: Option<&str>) -> Result<Client> {
         .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
         .use_rustls_tls()
-        .pool_max_idle_per_host(10)
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(args.pool_idle_timeout))
+        .connect_timeout(Duration::from_secs(args.connect_timeout))
+        .timeout(Duration::from_secs(args.request_timeout))
+        .danger_accept_invalid_certs(args.accept_invalid_certs)
         .build()
         .context("Failed to build HTTP client")
 }
@@ -360,13 +381,12 @@ async fn main() -> Result<()> {
 
     let batches: Vec<_> = documents.chunks(args.batch_size).map(Vec::from).collect();
 
-    let client = build_client(args.token.as_deref())?;
+    let client = build_client(&args)?;
     let m = MultiProgress::with_draw_target(ProgressDrawTarget::stdout());
 
-    let warmup_passes = 5;
-    let warmup = WarmupProgress::new(&m, warmup_passes * batches.len())?;
+    let warmup = WarmupProgress::new(&m, args.warmup_iterations * batches.len())?;
 
-    for _ in 0..warmup_passes {
+    for _ in 0..args.warmup_iterations {
         for batch in &batches {
             if let Err(e) = run_batch(&client, &url, &batch, &args.model_name).await {
                 bail!("Warm-up failed: {}", e);
