@@ -12,7 +12,7 @@ Binaries are provided for Linux and macOS (`x86_64` and `aarch64`).
 
     OS=linux
     ARCH=x86_64
-    V=0.2.0
+    V=0.3.0
     curl -sSf https://github.com/angt/perfembd/releases/download/v$V/perfembd-$ARCH-$OS.gz | gunzip > perfembd
     chmod +x perfembd
 
