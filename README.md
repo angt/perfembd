@@ -25,23 +25,22 @@ Binaries are provided for Linux and macOS (`x86_64` and `aarch64`).
 ### Args
 
     $ ./perfembd --help
-
     Benchmark tool for embedding endpoints
 
-    Usage: perfembd [OPTIONS] [TARGET_URL]
+    Usage: perfembd [OPTIONS] [URL]
 
     Arguments:
-      [TARGET_URL]  Target API base URL [default: http://localhost:3000/v1]
+      [URL]  Target API base URL [default: http://localhost:3000/v1]
 
     Options:
-      -c, --corpus-file <CORPUS_FILE>
+      -c, --corpus <CORPUS>
               Path to the corpus file (one document per line)
       -b, --batch-size <BATCH_SIZE>
               Number of documents per request batch [default: 128]
       -n, --iterations <ITERATIONS>
-              Number of benchmark iterations (full passes over the corpus) [default: 20]
+              Number of benchmark iterations (full passes over the corpus) [default: 256]
       -w, --warmup-iterations <WARMUP_ITERATIONS>
-              Number of warm-up iterations (full passes over the corpus) [default: 5]
+              Number of warm-up iterations (full passes over the corpus) [default: 24]
       -o, --output-file <OUTPUT_FILE>
               Output file for results (JSON format) [default: out.json]
           --token <TOKEN>
@@ -54,7 +53,7 @@ Binaries are provided for Linux and macOS (`x86_64` and `aarch64`).
               HTTP request timeout in seconds (for the entire request lifecycle) [default: 90]
           --pool-idle-timeout <POOL_IDLE_TIMEOUT>
               HTTP pool idle timeout in seconds (how long an idle connection is kept alive) [default: 90]
-          --accept-invalid-certs
+          --insecure
               Accept invalid TLS/SSL certificates
       -h, --help
               Print help

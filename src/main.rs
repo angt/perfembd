@@ -2,11 +2,13 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::{error, info};
+use rand::prelude::IndexedRandom;
+use rand::Rng;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     fs::File,
     io::{BufRead, BufReader, BufWriter},
     path::PathBuf,
@@ -21,22 +23,22 @@ const CORPUS: &str = include_str!("../corpus.txt");
 struct Args {
     /// Target API base URL.
     #[arg(default_value = "http://localhost:3000/v1")]
-    target_url: String,
+    url: String,
 
     /// Path to the corpus file (one document per line).
     #[arg(short = 'c', long)]
-    corpus_file: Option<PathBuf>,
+    corpus: Option<PathBuf>,
 
     /// Number of documents per request batch.
     #[arg(short = 'b', long, default_value_t = 128)]
     batch_size: usize,
 
     /// Number of benchmark iterations (full passes over the corpus).
-    #[arg(short = 'n', long, default_value_t = 20)]
+    #[arg(short = 'n', long, default_value_t = 256)]
     iterations: usize,
 
     /// Number of warm-up iterations (full passes over the corpus).
-    #[arg(short = 'w', long, default_value_t = 5)]
+    #[arg(short = 'w', long, default_value_t = 24)]
     warmup_iterations: usize,
 
     /// Output file for results (JSON format).
@@ -65,7 +67,7 @@ struct Args {
 
     /// Accept invalid TLS/SSL certificates.
     #[arg(long, default_value_t = false)]
-    accept_invalid_certs: bool,
+    insecure: bool,
 }
 
 #[derive(Serialize)]
@@ -84,7 +86,8 @@ struct UsageData {
     total_tokens: u64,
 }
 
-pub struct Stats {
+#[derive(Clone, Debug, Default)]
+pub struct Bucket {
     min: Option<u32>,
     max: Option<u32>,
     sum: u64,
@@ -93,16 +96,9 @@ pub struct Stats {
     upper_half: BinaryHeap<Reverse<u32>>,
 }
 
-impl Stats {
+impl Bucket {
     pub fn new() -> Self {
-        Stats {
-            min: None,
-            max: None,
-            sum: 0,
-            count: 0,
-            lower_half: BinaryHeap::new(),
-            upper_half: BinaryHeap::new(),
-        }
+        Default::default()
     }
 
     pub fn update(&mut self, value: u32) {
@@ -136,22 +132,22 @@ impl Stats {
         self.max
     }
 
-    pub fn avg(&self) -> Option<f64> {
+    pub fn avg(&self) -> Option<u32> {
         if self.count == 0 {
             None
         } else {
-            Some(self.sum as f64 / self.count as f64)
+            Some((self.sum / self.count) as u32)
         }
     }
 
-    pub fn median(&self) -> Option<f64> {
+    pub fn p50(&self) -> Option<u32> {
         if self.lower_half.len() == self.upper_half.len() {
             match (self.lower_half.peek(), self.upper_half.peek()) {
-                (Some(&l), Some(&Reverse(r))) => Some((l as f64 + r as f64) / 2.0),
+                (Some(&l), Some(&Reverse(r))) => Some((l + r) / 2),
                 _ => None,
             }
         } else {
-            self.lower_half.peek().map(|&val| val as f64)
+            self.lower_half.peek().copied()
         }
     }
 
@@ -160,114 +156,192 @@ impl Stats {
     }
 }
 
-struct BenchProgress {
-    count: ProgressBar,
-    errors: ProgressBar,
-    min: ProgressBar,
-    max: ProgressBar,
-    avg: ProgressBar,
-    median: ProgressBar,
-    iter: ProgressBar,
+#[derive(Debug)]
+pub struct Corpus {
+    docs: Vec<String>,
+    batch_size: usize,
+    rng: rand::rngs::ThreadRng,
 }
 
-impl BenchProgress {
-    fn new(m: &MultiProgress, count: usize) -> Result<BenchProgress> {
-        let stats_style = ProgressStyle::with_template("{prefix:>10}: {msg}")?;
+impl Corpus {
+    pub fn new(path: &Option<PathBuf>, batch_size: usize) -> Result<Self> {
+        let docs = if let Some(path) = path {
+            let file =
+                File::open(path).with_context(|| format!("Failed to open corpus: {:?}", path))?;
+            Self::read_corpus(BufReader::new(file))
+        } else {
+            Self::read_corpus(BufReader::new(CORPUS.as_bytes()))
+        }
+        .with_context(|| format!("Failed to parse corpus"))?;
 
-        let iter_style = ProgressStyle::with_template(
-            "{spinner:.green} Bench {pos:>4}/{len} [{elapsed_precise}] [{bar:40.cyan/blue}] {percent:>3}% | ETA: {eta}"
-        )?.progress_chars("#>-");
-
-        let make_stat_bar = |prefix: &'static str, msg: &'static str| {
-            let pb = m.add(ProgressBar::new(1));
-            pb.set_style(stats_style.clone());
-            pb.set_prefix(prefix);
-            pb.set_message(msg);
-            pb
-        };
-
-        Ok(BenchProgress {
-            count: make_stat_bar("Successful requests", "0"),
-            errors: make_stat_bar("Failed requests", "0"),
-            min: make_stat_bar("min tokens/s", "N/A"),
-            max: make_stat_bar("max tokens/s", "N/A"),
-            avg: make_stat_bar("avg tokens/s", "N/A"),
-            median: make_stat_bar("median tokens/s", "N/A"),
-            iter: {
-                let pb = m.add(ProgressBar::new(count as u64));
-                pb.set_style(iter_style);
-                pb
-            },
+        if docs.is_empty() {
+            bail!("Loaded corpus is empty. Cannot proceed with benchmarking.");
+        }
+        Ok(Self {
+            docs,
+            batch_size,
+            rng: rand::rng(),
         })
     }
 
-    fn update(&self, stats: &Stats, errors: u64) {
-        self.count.set_message(format!("{}", stats.count()));
-        self.errors.set_message(format!("{}", errors));
-        self.min.set_message(stats.min()
-            .map_or("N/A".into(), |v| format!("{}", v)));
-        self.max.set_message(stats.max()
-            .map_or("N/A".into(), |v| format!("{}", v)));
-        self.avg.set_message(stats.avg()
-            .map_or("N/A".into(), |v| format!("{:.1}", v)));
-        self.median.set_message(stats.median()
-            .map_or("N/A".into(), |v| format!("{:.1}", v)));
-        self.iter.inc(1);
+    pub fn random_batch(&mut self) -> Vec<String> {
+        let n = self.rng.random_range(1..=self.batch_size);
+
+        self.docs
+            .choose_multiple(&mut self.rng, n)
+            .cloned()
+            .collect()
     }
 
-    fn clear(&self) {
-        self.count.finish();
-        self.errors.finish();
-        self.min.finish();
-        self.max.finish();
-        self.avg.finish();
-        self.median.finish();
-        self.iter.finish_and_clear();
+    fn read_corpus<R: BufRead>(reader: R) -> Result<Vec<String>> {
+        reader
+            .lines()
+            .map(|line| {
+                let line = line?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    Ok(None)
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            })
+            .filter_map(Result::transpose)
+            .collect()
     }
 }
 
+struct BucketProgress {
+    pb: ProgressBar,
+}
+
+impl BucketProgress {
+    fn new(m: &MultiProgress, prefix: String) -> Result<Self> {
+        let style = ProgressStyle::with_template("{prefix:>14}: {msg}")?;
+        let pb = m.add(ProgressBar::new(1));
+        pb.set_style(style.clone());
+        pb.set_prefix(prefix);
+        pb.set_message(Self::format(
+            String::from(""),
+            String::from(""),
+            String::from(""),
+            String::from(""),
+            String::from(""),
+        ));
+        Ok(Self { pb })
+    }
+
+    fn format(count: String, min: String, max: String, avg: String, p50: String) -> String {
+        format!(
+            " {:>7} | {:>7} | {:>7} | {:>7} | {:>7} ",
+            count, min, max, avg, p50
+        )
+    }
+
+    fn header(&self) {
+        let message = Self::format(
+            String::from("count"),
+            String::from("min"),
+            String::from("max"),
+            String::from("avg"),
+            String::from("median"),
+        );
+        self.pb.set_message(message);
+    }
+
+    fn update(&self, bucket: &Bucket) {
+        let message = Self::format(
+            bucket.count().to_string(),
+            bucket.min().map(|v| v.to_string()).unwrap_or_default(),
+            bucket.max().map(|v| v.to_string()).unwrap_or_default(),
+            bucket.avg().map(|v| v.to_string()).unwrap_or_default(),
+            bucket.p50().map(|v| v.to_string()).unwrap_or_default(),
+        );
+        self.pb.set_message(message);
+    }
+
+    fn clear(&self) {
+        self.pb.finish();
+    }
+}
+
+struct BenchProgress {
+    header: BucketProgress,
+    buckets: Vec<BucketProgress>,
+    pb: ProgressBar,
+}
+
+impl BenchProgress {
+    fn new(m: &MultiProgress, size: usize, count: usize) -> Result<Self> {
+        let header = BucketProgress::new(m, "tokens".into())?;
+        header.header();
+
+        let mut buckets = Vec::with_capacity(size);
+
+        for i in 0..size {
+            buckets.push(BucketProgress::new(m, 2usize.pow(i as u32).to_string())?);
+        }
+        let pb = m.add(ProgressBar::new(count as u64));
+        pb.set_style(make_progress_style("Bench", "green", "cyan/blue"));
+
+        Ok(Self {
+            header,
+            buckets,
+            pb,
+        })
+    }
+
+    fn update(&self, buckets: &[Bucket], _errors: u64) {
+        if self.buckets.len() == buckets.len() {
+            for (s, new) in self.buckets.iter().zip(buckets) {
+                s.update(new);
+            }
+        }
+        self.pb.inc(1);
+    }
+
+    fn clear(&self) {
+        self.header.clear();
+
+        for bucket in &self.buckets {
+            bucket.clear();
+        }
+        self.pb.finish_and_clear();
+    }
+}
+
+fn make_progress_style(title: &str, spinner_color: &str, bar_colors: &str) -> ProgressStyle {
+    let template = format!(
+        "{{spinner:.{spinner_color}}} {title} {{pos:>4}}/{{len}} \
+        [{{elapsed_precise}}] [{{bar:40.{bar_colors}}}] \
+        {{percent:>3}}% | ETA: {{eta}}",
+        spinner_color = spinner_color,
+        title = title,
+        bar_colors = bar_colors,
+    );
+    ProgressStyle::with_template(&template)
+        .expect("invalid template")
+        .progress_chars("#>-")
+}
+
 struct WarmupProgress {
-    iter: ProgressBar,
+    pb: ProgressBar,
 }
 
 impl WarmupProgress {
     fn new(m: &MultiProgress, count: usize) -> Result<Self> {
-        let iter_style = ProgressStyle::with_template(
-            "{spinner:.yellow} Warm-up {pos:>4}/{len} [{elapsed_precise}] [{bar:40.yellow/orange}] {percent:>3}% | ETA: {eta}"
-        )?.progress_chars("#>-");
+        let pb = m.add(ProgressBar::new(count as u64));
+        pb.set_style(make_progress_style("Warm-up", "yellow", "yellow/orange"));
 
-        Ok(WarmupProgress {
-            iter: {
-                let pb = m.add(ProgressBar::new(count as u64));
-                pb.set_style(iter_style);
-                pb
-            },
-        })
+        Ok(Self { pb })
     }
 
     fn update(&self) {
-        self.iter.inc(1);
+        self.pb.inc(1);
     }
 
     fn clear(&self) {
-        self.iter.finish_and_clear();
+        self.pb.finish_and_clear();
     }
-}
-
-fn read_corpus<R: BufRead>(reader: R) -> Result<Vec<String>> {
-    reader
-        .lines()
-        .map(|line| {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_string()))
-            }
-        })
-        .filter_map(Result::transpose)
-        .collect()
 }
 
 fn build_client(args: &Args) -> Result<Client> {
@@ -285,13 +359,17 @@ fn build_client(args: &Args) -> Result<Client> {
         );
     }
     Client::builder()
-        .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+        .user_agent(format!(
+            "{}/{}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        ))
         .default_headers(headers)
         .use_rustls_tls()
         .pool_idle_timeout(Duration::from_secs(args.pool_idle_timeout))
         .connect_timeout(Duration::from_secs(args.connect_timeout))
         .timeout(Duration::from_secs(args.request_timeout))
-        .danger_accept_invalid_certs(args.accept_invalid_certs)
+        .danger_accept_invalid_certs(args.insecure)
         .build()
         .context("Failed to build HTTP client")
 }
@@ -299,7 +377,10 @@ fn build_client(args: &Args) -> Result<Client> {
 #[derive(Error, Debug)]
 pub enum BatchError {
     #[error("API request failed with status {status}: {source}")]
-    ApiError { status: reqwest::StatusCode, source: reqwest::Error },
+    ApiError {
+        status: reqwest::StatusCode,
+        source: reqwest::Error,
+    },
     #[error("API request error: {0}")]
     RequestError(#[from] reqwest::Error),
     #[error("Failed to compute token/s")]
@@ -311,7 +392,7 @@ pub async fn run_batch(
     url: &str,
     batch: &[String],
     model_name: &str,
-) -> Result<u32, BatchError> {
+) -> Result<(u32, u64), BatchError> {
     let request_payload = EmbeddingRequest {
         input: batch.to_vec(),
         model: model_name.to_string(),
@@ -341,21 +422,26 @@ pub async fn run_batch(
     if tps <= 0.0 || tps > u32::MAX as f64 {
         return Err(BatchError::Invalid);
     }
-    Ok(tps as u32)
+    Ok((tps as u32, tokens))
+}
+
+#[derive(Serialize)]
+struct StatResult {
+    tokens: usize,
+    requests_in_bucket: u64,
+    min_tokens_per_second: Option<u32>,
+    max_tokens_per_second: Option<u32>,
+    avg_tokens_per_second: Option<u32>,
+    median_tokens_per_second: Option<u32>,
 }
 
 #[derive(Serialize)]
 struct BenchResult {
     url: String,
     model_name: String,
-    batch_size: usize,
     iterations: usize,
-    successful_requests: u64,
     errors: u64,
-    min_tokens_per_second: Option<u32>,
-    max_tokens_per_second: Option<u32>,
-    avg_tokens_per_second: Option<f64>,
-    median_tokens_per_second: Option<f64>,
+    stats: Vec<StatResult>,
 }
 
 #[tokio::main]
@@ -368,65 +454,68 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let url = format!("{}/embeddings", args.target_url.trim_end_matches('/'));
+    let url = format!("{}/embeddings", args.url.trim_end_matches('/'));
 
-    let documents = if let Some(path) = &args.corpus_file {
-        let file =
-            File::open(path).with_context(|| format!("Failed to open corpus: {:?}", path))?;
-        read_corpus(BufReader::new(file))
-    } else {
-        read_corpus(BufReader::new(CORPUS.as_bytes()))
-    }
-    .with_context(|| format!("Failed to parse corpus"))?;
-
-    let batches: Vec<_> = documents.chunks(args.batch_size).map(Vec::from).collect();
-
+    let mut corpus = Corpus::new(&args.corpus, args.batch_size)?;
     let client = build_client(&args)?;
     let m = MultiProgress::with_draw_target(ProgressDrawTarget::stdout());
 
-    let warmup = WarmupProgress::new(&m, args.warmup_iterations * batches.len())?;
+    let warmup = WarmupProgress::new(&m, args.warmup_iterations)?;
 
     for _ in 0..args.warmup_iterations {
-        for batch in &batches {
-            if let Err(e) = run_batch(&client, &url, &batch, &args.model_name).await {
-                bail!("Warm-up failed: {}", e);
-            }
-            warmup.update();
+        let batch = corpus.random_batch();
+
+        if let Err(e) = run_batch(&client, &url, &batch, &args.model_name).await {
+            bail!("Warm-up failed: {}", e);
         }
+        warmup.update();
     }
     warmup.clear();
 
-    let bench = BenchProgress::new(&m, args.iterations * batches.len())?;
-    let mut stats = Stats::new();
+    let mut buckets: Vec<Bucket> = vec![Bucket::new(); 15];
     let mut errors: u64 = 0;
+    let bench = BenchProgress::new(&m, buckets.len(), args.iterations)?;
 
     for _ in 0..args.iterations {
-        for batch in &batches {
-            match run_batch(&client, &url, &batch, &args.model_name).await {
-                Ok(tps) => stats.update(tps),
-                Err(_err) => errors += 1,
+        let batch = corpus.random_batch();
+
+        match run_batch(&client, &url, &batch, &args.model_name).await {
+            Ok((tps, tokens)) => {
+                let idx = (tokens.ilog2() as usize).min(buckets.len() - 1);
+                buckets[idx].update(tps);
             }
-            bench.update(&stats, errors);
+            Err(_err) => errors += 1,
         }
+        bench.update(&buckets, errors);
     }
     bench.clear();
 
-    let results = BenchResult {
+    let mut stats: Vec<StatResult> = Vec::new();
+
+    for (idx, stat) in buckets.iter().enumerate() {
+        if stat.count() > 0 {
+            let result = StatResult {
+                tokens: 2usize.pow(idx as u32),
+                requests_in_bucket: stat.count(),
+                min_tokens_per_second: stat.min(),
+                max_tokens_per_second: stat.max(),
+                avg_tokens_per_second: stat.avg(),
+                median_tokens_per_second: stat.p50(),
+            };
+            stats.push(result);
+        }
+    }
+    let bench = BenchResult {
         url,
         model_name: args.model_name,
-        batch_size: args.batch_size,
         iterations: args.iterations,
-        successful_requests: stats.count(),
-        errors: errors,
-        min_tokens_per_second: stats.min(),
-        max_tokens_per_second: stats.max(),
-        avg_tokens_per_second: stats.avg(),
-        median_tokens_per_second: stats.median(),
+        errors,
+        stats,
     };
     let file = File::create(&args.output_file)
         .with_context(|| format!("Failed to create: {}", args.output_file.display()))?;
 
-    serde_json::to_writer_pretty(BufWriter::new(file), &results)
+    serde_json::to_writer_pretty(BufWriter::new(file), &bench)
         .with_context(|| format!("Failed to write: {}", args.output_file.display()))?;
 
     info!("Results written in {}", args.output_file.display());
