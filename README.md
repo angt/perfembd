@@ -10,17 +10,15 @@ There are two ways to install `perfembd`:
 
 Binaries are provided for Linux and macOS (`x86_64` and `aarch64`).
 
-    OS=linux
-    ARCH=x86_64
+    OS=linux     # or macos
+    ARCH=x86_64  # or aarch64
     V=0.3.0
     curl -sSf https://github.com/angt/perfembd/releases/download/v$V/perfembd-$ARCH-$OS.gz | gunzip > perfembd
     chmod +x perfembd
 
 ### From Source (Requires Rust toolchain)
 
-    git clone https://github.com/angt/perfembd
-    cd perfembd
-    cargo install --path .
+    cargo install --git https://github.com/angt/perfembd
 
 ### Args
 
