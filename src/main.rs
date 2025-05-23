@@ -265,7 +265,7 @@ impl BucketProgress {
         stdev: String,
     ) -> String {
         format!(
-            " {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} ",
+            " {:>7} | {:>7} | {:>7} | {:>7} | {:>10} | {:>10} ",
             count, min, max, p50, avg, stdev
         )
     }
