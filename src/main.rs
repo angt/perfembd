@@ -91,6 +91,7 @@ pub struct Bucket {
     min: Option<u32>,
     max: Option<u32>,
     sum: u64,
+    sum_sq: u128,
     count: u64,
     lower_half: BinaryHeap<u32>,
     upper_half: BinaryHeap<Reverse<u32>>,
@@ -106,6 +107,7 @@ impl Bucket {
         self.max = Some(self.max.map(|m| m.max(value)).unwrap_or(value));
 
         self.sum += value as u64;
+        self.sum_sq += (value as u128) * (value as u128);
         self.count += 1;
 
         if self.lower_half.peek().map_or(true, |&m| value <= m) {
@@ -132,11 +134,11 @@ impl Bucket {
         self.max
     }
 
-    pub fn avg(&self) -> Option<u32> {
+    pub fn avg(&self) -> Option<f64> {
         if self.count == 0 {
             None
         } else {
-            Some((self.sum / self.count) as u32)
+            Some(self.sum as f64 / self.count as f64)
         }
     }
 
@@ -153,6 +155,29 @@ impl Bucket {
 
     pub fn count(&self) -> u64 {
         self.count
+    }
+
+    pub fn variance(&self) -> Option<f64> {
+        if self.count < 2 {
+            return None;
+        }
+        let count = self.count as f64;
+        let sum = self.sum as f64;
+        let sum_sq = self.sum_sq as f64;
+
+        let mean_sq = sum_sq / count;
+        let mean = sum / count;
+        let variance = mean_sq - (mean * mean);
+
+        if variance < 0.0 {
+            Some(0.0)
+        } else {
+            Some(variance)
+        }
+    }
+
+    pub fn stdev(&self) -> Option<f64> {
+        self.variance().map(|v| v.sqrt())
     }
 }
 
@@ -226,14 +251,22 @@ impl BucketProgress {
             String::from(""),
             String::from(""),
             String::from(""),
+            String::from(""),
         ));
         Ok(Self { pb })
     }
 
-    fn format(count: String, min: String, max: String, avg: String, p50: String) -> String {
+    fn format(
+        count: String,
+        min: String,
+        max: String,
+        p50: String,
+        avg: String,
+        stdev: String,
+    ) -> String {
         format!(
-            " {:>7} | {:>7} | {:>7} | {:>7} | {:>7} ",
-            count, min, max, avg, p50
+            " {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} ",
+            count, min, max, p50, avg, stdev
         )
     }
 
@@ -242,8 +275,9 @@ impl BucketProgress {
             String::from("count"),
             String::from("min"),
             String::from("max"),
-            String::from("avg"),
             String::from("median"),
+            String::from("avg"),
+            String::from("stdev"),
         );
         self.pb.set_message(message);
     }
@@ -253,8 +287,15 @@ impl BucketProgress {
             bucket.count().to_string(),
             bucket.min().map(|v| v.to_string()).unwrap_or_default(),
             bucket.max().map(|v| v.to_string()).unwrap_or_default(),
-            bucket.avg().map(|v| v.to_string()).unwrap_or_default(),
             bucket.p50().map(|v| v.to_string()).unwrap_or_default(),
+            bucket
+                .avg()
+                .map(|v| format!("{:.2}", v))
+                .unwrap_or_default(),
+            bucket
+                .stdev()
+                .map(|v| format!("{:.2}", v))
+                .unwrap_or_default(),
         );
         self.pb.set_message(message);
     }
@@ -312,11 +353,8 @@ impl BenchProgress {
 fn make_progress_style(title: &str, spinner_color: &str, bar_colors: &str) -> ProgressStyle {
     let template = format!(
         "{{spinner:.{spinner_color}}} {title} {{pos:>4}}/{{len}} \
-        [{{elapsed_precise}}] [{{bar:40.{bar_colors}}}] \
-        {{percent:>3}}% | ETA: {{eta}}",
-        spinner_color = spinner_color,
-        title = title,
-        bar_colors = bar_colors,
+         [{{elapsed_precise}}] [{{bar:40.{bar_colors}}}] \
+         {{percent:>3}}% | ETA: {{eta}}",
     );
     ProgressStyle::with_template(&template)
         .expect("invalid template")
@@ -431,8 +469,9 @@ struct StatResult {
     requests_in_bucket: u64,
     min_tokens_per_second: Option<u32>,
     max_tokens_per_second: Option<u32>,
-    avg_tokens_per_second: Option<u32>,
     median_tokens_per_second: Option<u32>,
+    avg_tokens_per_second: Option<f64>,
+    stdev_tokens_per_second: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -499,8 +538,9 @@ async fn main() -> Result<()> {
                 requests_in_bucket: stat.count(),
                 min_tokens_per_second: stat.min(),
                 max_tokens_per_second: stat.max(),
-                avg_tokens_per_second: stat.avg(),
                 median_tokens_per_second: stat.p50(),
+                avg_tokens_per_second: stat.avg(),
+                stdev_tokens_per_second: stat.stdev(),
             };
             stats.push(result);
         }
