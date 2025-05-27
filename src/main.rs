@@ -122,15 +122,15 @@ impl Bucket {
         self.max
     }
 
-    pub fn avg(&self) -> Option<f64> {
+    pub fn avg(&self) -> Option<u32> {
         if self.count == 0 {
             None
         } else {
-            Some(self.sum as f64 / self.count as f64)
+            Some((self.sum / self.count) as u32)
         }
     }
 
-    fn percentile(&self, percent: usize) -> Option<u32> {
+    fn p(&self, percent: usize) -> Option<u32> {
         if self.values.is_empty() {
             return None;
         }
@@ -141,27 +141,23 @@ impl Bucket {
         self.count
     }
 
-    pub fn variance(&self) -> Option<f64> {
+    pub fn variance(&self) -> Option<u32> {
         if self.count < 2 {
             return None;
         }
-        let count = self.count as f64;
-        let sum = self.sum as f64;
-        let sum_sq = self.sum_sq as f64;
+        let mean_sq = self.sum_sq / self.count as u128;
+        let mean = (self.sum / self.count) as i128;
+        let variance = mean_sq as i128 - (mean * mean);
 
-        let mean_sq = sum_sq / count;
-        let mean = sum / count;
-        let variance = mean_sq - (mean * mean);
-
-        if variance < 0.0 {
-            Some(0.0)
+        if variance < 0 {
+            Some(0)
         } else {
-            Some(variance)
+            Some(variance as u32)
         }
     }
 
-    pub fn stdev(&self) -> Option<f64> {
-        self.variance().map(|v| v.sqrt())
+    pub fn stdev(&self) -> Option<u32> {
+        self.variance().map(|v| v.isqrt())
     }
 }
 
@@ -253,7 +249,7 @@ impl BucketProgress {
         stdev: String,
     ) -> String {
         format!(
-            " {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>10} | {:>10} ",
+            " {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} ",
             count, min, p25, p50, p75, max, avg, stdev
         )
     }
@@ -276,18 +272,12 @@ impl BucketProgress {
         let message = Self::format(
             bucket.count().to_string(),
             bucket.min().map(|v| v.to_string()).unwrap_or_default(),
-            bucket.percentile(25).map(|v| v.to_string()).unwrap_or_default(),
-            bucket.percentile(50).map(|v| v.to_string()).unwrap_or_default(),
-            bucket.percentile(75).map(|v| v.to_string()).unwrap_or_default(),
+            bucket.p(25).map(|v| v.to_string()).unwrap_or_default(),
+            bucket.p(50).map(|v| v.to_string()).unwrap_or_default(),
+            bucket.p(75).map(|v| v.to_string()).unwrap_or_default(),
             bucket.max().map(|v| v.to_string()).unwrap_or_default(),
-            bucket
-                .avg()
-                .map(|v| format!("{:.2}", v))
-                .unwrap_or_default(),
-            bucket
-                .stdev()
-                .map(|v| format!("{:.2}", v))
-                .unwrap_or_default(),
+            bucket.avg().map(|v| v.to_string()).unwrap_or_default(),
+            bucket.stdev().map(|v| v.to_string()).unwrap_or_default(),
         );
         self.pb.set_message(message);
     }
@@ -463,8 +453,8 @@ struct StatResult {
     p50_tokens_per_second: Option<u32>,
     p75_tokens_per_second: Option<u32>,
     max_tokens_per_second: Option<u32>,
-    avg_tokens_per_second: Option<f64>,
-    stdev_tokens_per_second: Option<f64>,
+    avg_tokens_per_second: Option<u32>,
+    stdev_tokens_per_second: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -530,9 +520,9 @@ async fn main() -> Result<()> {
                 tokens: 2usize.pow(idx as u32),
                 requests_in_bucket: stat.count(),
                 min_tokens_per_second: stat.min(),
-                p25_tokens_per_second: stat.percentile(25),
-                p50_tokens_per_second: stat.percentile(50),
-                p75_tokens_per_second: stat.percentile(75),
+                p25_tokens_per_second: stat.p(25),
+                p50_tokens_per_second: stat.p(50),
+                p75_tokens_per_second: stat.p(75),
                 max_tokens_per_second: stat.max(),
                 avg_tokens_per_second: stat.avg(),
                 stdev_tokens_per_second: stat.stdev(),
