@@ -1,14 +1,12 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use log::{error, info};
+use log::error;
 use rand::prelude::IndexedRandom;
 use rand::Rng;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
     fs::File,
     io::{BufRead, BufReader, BufWriter},
     path::PathBuf,
@@ -93,8 +91,7 @@ pub struct Bucket {
     sum: u64,
     sum_sq: u128,
     count: u64,
-    lower_half: BinaryHeap<u32>,
-    upper_half: BinaryHeap<Reverse<u32>>,
+    values: Vec<u32>,
 }
 
 impl Bucket {
@@ -110,20 +107,11 @@ impl Bucket {
         self.sum_sq += (value as u128) * (value as u128);
         self.count += 1;
 
-        if self.lower_half.peek().map_or(true, |&m| value <= m) {
-            self.lower_half.push(value);
-        } else {
-            self.upper_half.push(Reverse(value));
-        }
-        if self.lower_half.len() > self.upper_half.len() + 1 {
-            if let Some(v) = self.lower_half.pop() {
-                self.upper_half.push(Reverse(v));
-            }
-        } else if self.upper_half.len() > self.lower_half.len() {
-            if let Some(Reverse(v)) = self.upper_half.pop() {
-                self.lower_half.push(v);
-            }
-        }
+        let pos = match self.values.binary_search(&value) {
+            Ok(index) => index,
+            Err(index) => index,
+        };
+        self.values.insert(pos, value);
     }
 
     pub fn min(&self) -> Option<u32> {
@@ -142,15 +130,11 @@ impl Bucket {
         }
     }
 
-    pub fn p50(&self) -> Option<u32> {
-        if self.lower_half.len() == self.upper_half.len() {
-            match (self.lower_half.peek(), self.upper_half.peek()) {
-                (Some(&l), Some(&Reverse(r))) => Some((l + r) / 2),
-                _ => None,
-            }
-        } else {
-            self.lower_half.peek().copied()
+    fn percentile(&self, percent: usize) -> Option<u32> {
+        if self.values.is_empty() {
+            return None;
         }
+        Some(self.values[(self.values.len() - 1) * percent / 100])
     }
 
     pub fn count(&self) -> u64 {
@@ -241,11 +225,13 @@ struct BucketProgress {
 
 impl BucketProgress {
     fn new(m: &MultiProgress, prefix: String) -> Result<Self> {
-        let style = ProgressStyle::with_template("{prefix:>14}: {msg}")?;
+        let style = ProgressStyle::with_template("{prefix:>7}: {msg}")?;
         let pb = m.add(ProgressBar::new(1));
         pb.set_style(style.clone());
         pb.set_prefix(prefix);
         pb.set_message(Self::format(
+            String::from(""),
+            String::from(""),
             String::from(""),
             String::from(""),
             String::from(""),
@@ -259,14 +245,16 @@ impl BucketProgress {
     fn format(
         count: String,
         min: String,
-        max: String,
+        p25: String,
         p50: String,
+        p75: String,
+        max: String,
         avg: String,
         stdev: String,
     ) -> String {
         format!(
-            " {:>7} | {:>7} | {:>7} | {:>7} | {:>10} | {:>10} ",
-            count, min, max, p50, avg, stdev
+            " {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7} | {:>10} | {:>10} ",
+            count, min, p25, p50, p75, max, avg, stdev
         )
     }
 
@@ -274,8 +262,10 @@ impl BucketProgress {
         let message = Self::format(
             String::from("count"),
             String::from("min"),
-            String::from("max"),
+            String::from("p25"),
             String::from("median"),
+            String::from("p75"),
+            String::from("max"),
             String::from("avg"),
             String::from("stdev"),
         );
@@ -286,8 +276,10 @@ impl BucketProgress {
         let message = Self::format(
             bucket.count().to_string(),
             bucket.min().map(|v| v.to_string()).unwrap_or_default(),
+            bucket.percentile(25).map(|v| v.to_string()).unwrap_or_default(),
+            bucket.percentile(50).map(|v| v.to_string()).unwrap_or_default(),
+            bucket.percentile(75).map(|v| v.to_string()).unwrap_or_default(),
             bucket.max().map(|v| v.to_string()).unwrap_or_default(),
-            bucket.p50().map(|v| v.to_string()).unwrap_or_default(),
             bucket
                 .avg()
                 .map(|v| format!("{:.2}", v))
@@ -369,7 +361,6 @@ impl WarmupProgress {
     fn new(m: &MultiProgress, count: usize) -> Result<Self> {
         let pb = m.add(ProgressBar::new(count as u64));
         pb.set_style(make_progress_style("Warm-up", "yellow", "yellow/orange"));
-
         Ok(Self { pb })
     }
 
@@ -468,8 +459,10 @@ struct StatResult {
     tokens: usize,
     requests_in_bucket: u64,
     min_tokens_per_second: Option<u32>,
+    p25_tokens_per_second: Option<u32>,
+    p50_tokens_per_second: Option<u32>,
+    p75_tokens_per_second: Option<u32>,
     max_tokens_per_second: Option<u32>,
-    median_tokens_per_second: Option<u32>,
     avg_tokens_per_second: Option<f64>,
     stdev_tokens_per_second: Option<f64>,
 }
@@ -537,8 +530,10 @@ async fn main() -> Result<()> {
                 tokens: 2usize.pow(idx as u32),
                 requests_in_bucket: stat.count(),
                 min_tokens_per_second: stat.min(),
+                p25_tokens_per_second: stat.percentile(25),
+                p50_tokens_per_second: stat.percentile(50),
+                p75_tokens_per_second: stat.percentile(75),
                 max_tokens_per_second: stat.max(),
-                median_tokens_per_second: stat.p50(),
                 avg_tokens_per_second: stat.avg(),
                 stdev_tokens_per_second: stat.stdev(),
             };
@@ -557,8 +552,6 @@ async fn main() -> Result<()> {
 
     serde_json::to_writer_pretty(BufWriter::new(file), &bench)
         .with_context(|| format!("Failed to write: {}", args.output_file.display()))?;
-
-    info!("Results written in {}", args.output_file.display());
 
     Ok(())
 }
