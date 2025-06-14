@@ -28,8 +28,8 @@ struct Args {
     corpus: Option<PathBuf>,
 
     /// Number of documents per request batch.
-    #[arg(short = 'b', long, default_value_t = 128)]
-    batch_size: usize,
+    #[arg(short = 'b', long)]
+    batch_size: Option<usize>,
 
     /// Number of benchmark iterations (full passes over the corpus).
     #[arg(short = 'n', long, default_value_t = 256)]
@@ -169,7 +169,7 @@ pub struct Corpus {
 }
 
 impl Corpus {
-    pub fn new(path: &Option<PathBuf>, batch_size: usize) -> Result<Self> {
+    pub fn new(path: &Option<PathBuf>, batch_size: Option<usize>) -> Result<Self> {
         let docs = if let Some(path) = path {
             let file =
                 File::open(path).with_context(|| format!("Failed to open corpus: {:?}", path))?;
@@ -182,6 +182,8 @@ impl Corpus {
         if docs.is_empty() {
             bail!("Loaded corpus is empty. Cannot proceed with benchmarking.");
         }
+        let batch_size = batch_size.unwrap_or(docs.len());
+
         Ok(Self {
             docs,
             batch_size,
